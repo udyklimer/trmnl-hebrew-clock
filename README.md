@@ -74,3 +74,7 @@ Both `http://` and `https://` are supported. HTTPS certificates are not verified
 - [PNGdec](https://github.com/bitbank2/PNGdec): PNG decoder
 - [WiFiManager](https://github.com/tzapu/WiFiManager): Wi-Fi and settings portal
 - [ESP_DoubleResetDetector](https://github.com/khoih-prog/ESP_DoubleResetDetector): double-reset detection
+
+## License
+
+Released under the [MIT License](LICENSE). The libraries listed above have their own licenses.
