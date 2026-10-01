@@ -45,7 +45,9 @@ The portal closes after 3 minutes without input. The device then sleeps for a mi
 
 ### Changing the settings later
 
-Press the reset button twice within 5 seconds. The device opens the `HebrewClock-Setup` portal again, with the current values filled in.
+Make the saved Wi-Fi network unavailable to the device, for example by switching off the router or moving the device out of range. On its next wake (within a minute) the device tries the saved network for 10 seconds, then shows the "WiFi Setup Mode" screen and opens the `HebrewClock-Setup` portal again, with the current values filled in.
+
+Keep the network unavailable until the setup screen appears. The portal then stays open for 3 minutes, so the network can be switched back on while you change the settings.
 
 The portal also opens by itself if Wi-Fi is connected but no user name has been set.
 
@@ -73,7 +75,7 @@ Both `http://` and `https://` are supported. HTTPS certificates are not verified
 - [GxEPD2](https://github.com/ZinggJM/GxEPD2): e-paper display driver
 - [PNGdec](https://github.com/bitbank2/PNGdec): PNG decoder
 - [WiFiManager](https://github.com/tzapu/WiFiManager): Wi-Fi and settings portal
-- [ESP_DoubleResetDetector](https://github.com/khoih-prog/ESP_DoubleResetDetector): double-reset detection
+- [ESP_DoubleResetDetector](https://github.com/khoih-prog/ESP_DoubleResetDetector): double-reset detection (included in the code, but not currently a working way to open the portal)
 
 ## License
 
