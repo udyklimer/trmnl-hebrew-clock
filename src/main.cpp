@@ -7,15 +7,13 @@
 #include <PNGdec.h>
 #include <Preferences.h>
 #include <time.h>
+#include <driver/rtc_io.h>
 
-#define ESP_DRD_USE_EEPROM true
-#define DOUBLERESETDETECTOR_DEBUG false
-#include <ESP_DoubleResetDetector.h>
-
-// Double reset detector settings (5s timeout)
-#define DRD_TIMEOUT 5
-#define DRD_ADDRESS 0
-DoubleResetDetector drd(DRD_TIMEOUT, DRD_ADDRESS);
+// KEY1 on the TRMNL OG DIY Kit (D1, active low). KEY2 is D2 and KEY3 is D4.
+// One press wakes the device from deep sleep (handy before a firmware upload);
+// a second press within SETUP_PRESS_WINDOW_MS opens the config portal.
+#define SETUP_BUTTON D1
+#define SETUP_PRESS_WINDOW_MS 3000
 
 // Official pin setup for Seeed Studio / TRMNL OG DIY Kit
 #define EPD_BUSY 4   // GPIO 4
@@ -81,6 +79,33 @@ String buildImageUrl(String srv, const String& user) {
   return url;
 }
 
+// Deep sleep for the given time, waking early if the setup button is pressed
+void enterDeepSleep(uint32_t seconds) {
+  // Keep the button pulled up while sleeping so only a press pulls it low
+  rtc_gpio_pullup_en((gpio_num_t)SETUP_BUTTON);
+  rtc_gpio_pulldown_dis((gpio_num_t)SETUP_BUTTON);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)SETUP_BUTTON, 0);
+  esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
+  esp_deep_sleep_start();
+}
+
+// After a button wake, wait for the button to be released and pressed again
+bool waitForSecondPress() {
+  unsigned long start = millis();
+  bool released = false;
+  while (millis() - start < SETUP_PRESS_WINDOW_MS) {
+    bool pressed = (digitalRead(SETUP_BUTTON) == LOW);
+    if (!released && !pressed) {
+      released = true;
+      delay(50); // debounce the release
+    } else if (released && pressed) {
+      return true;
+    }
+    delay(5);
+  }
+  return false;
+}
+
 void showSetupScreen() {
   display.setFullWindow();
   display.firstPage();
@@ -122,7 +147,19 @@ int pngDraw(PNGDRAW *pDraw) {
 
 void setup() {
   Serial.begin(115200);
+
+  // If the setup button woke us, a second press opens the config portal
+  rtc_gpio_deinit((gpio_num_t)SETUP_BUTTON);
+  pinMode(SETUP_BUTTON, INPUT_PULLUP);
+  bool forceConfigPortal = false;
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+    forceConfigPortal = waitForSecondPress();
+  }
+
   delay(500);
+  if (forceConfigPortal) {
+    Serial.println("Setup button pressed twice. Forcing config portal...");
+  }
 
   // Initialize SPI bus for display
   SPI.end();
@@ -136,15 +173,6 @@ void setup() {
   // Load saved preferences from flash
   String username = loadPreference("username", "");
   String server = loadPreference("server", DEFAULT_SERVER);
-
-  // Check double reset (only if not waking from deep sleep)
-  bool forceConfigPortal = false;
-  if (esp_reset_reason() != ESP_RST_DEEPSLEEP) {
-    if (drd.detectDoubleReset()) {
-      Serial.println("Double reset detected! Forcing config portal...");
-      forceConfigPortal = true;
-    }
-  }
 
   WiFiManager wm;
   wm.setConnectTimeout(10);
@@ -197,12 +225,6 @@ void setup() {
     connected = wm.startConfigPortal("HebrewClock-Setup");
   }
 
-
-
-
-  // Stop double reset detector state
-  drd.stop();
-
   // Retrieve values from custom fields
   String entered_user = String(custom_username.getValue());
   entered_user.trim();
@@ -220,8 +242,7 @@ void setup() {
 
   if (!connected) {
     Serial.println("Failed to connect or hit portal timeout. Going to sleep...");
-    esp_sleep_enable_timer_wakeup(60 * 1000000ULL);
-    esp_deep_sleep_start();
+    enterDeepSleep(60);
   }
 
   Serial.println("WiFi Connected! IP: " + WiFi.localIP().toString());
@@ -303,8 +324,7 @@ void setup() {
     Serial.printf("NTP sync failed. Falling back to %u sec sleep.\n", sleepSec);
   }
 
-  esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
-  esp_deep_sleep_start();
+  enterDeepSleep(sleepSec);
 }
 
 void loop() {
