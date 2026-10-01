@@ -1,5 +1,7 @@
+.pio/
 .vscode/
 .idea/
 build/
 *.bin
 *.elf
+compile_commands.json
