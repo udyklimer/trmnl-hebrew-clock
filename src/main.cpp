@@ -42,6 +42,60 @@ const char* DEFAULT_SERVER = "https://clock.udyklimer.com";
 // Always use full refresh with the GDEY075T7's fast OTP waveform (~1.2s).
 // Partial refresh on this panel accumulates ghosting that only a full refresh clears.
 
+// Battery measurement on the TRMNL OG DIY Kit: voltage on GPIO 1 (D0/A0),
+// with the measuring circuit switched on by driving GPIO 6 (A5) HIGH.
+#define BATTERY_ADC_PIN 1
+#define BATTERY_ENABLE_PIN 6
+#define BATTERY_SAMPLES 16
+#define BATTERY_MIN_MV 2500         // Readings outside this range are treated as failed
+#define BATTERY_MAX_MV 4500
+// USB power lifts the reading by about 50 mV on the very next wake, while the
+// wake-to-wake noise is under 10 mV, so a step larger than this means USB was
+// plugged in (rise) or unplugged (drop).
+#define CHARGING_STEP_MV 30
+
+// Kept across deep sleep to compare each wake with the previous one
+#define CHARGING_UNKNOWN -1
+RTC_DATA_ATTR int previousBatteryMv = 0;              // 0 = no previous reading
+RTC_DATA_ATTR int chargingState = CHARGING_UNKNOWN;   // -1 unknown, 0 on battery, 1 on USB
+
+// Read the battery voltage in millivolts, or 0 if the reading is implausible
+int readBatteryMv() {
+  pinMode(BATTERY_ENABLE_PIN, OUTPUT);
+  digitalWrite(BATTERY_ENABLE_PIN, HIGH);
+  analogReadResolution(12);
+  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+  delay(10);
+
+  uint32_t sum = 0;
+  for (int i = 0; i < BATTERY_SAMPLES; i++) {
+    sum += analogRead(BATTERY_ADC_PIN);
+    delay(2);
+  }
+  digitalWrite(BATTERY_ENABLE_PIN, LOW);
+
+  // Conversion from Seeed's Arduino guide for this kit
+  float raw = (float)sum / BATTERY_SAMPLES;
+  int mv = (int)((raw / 4095.0f) * 3.6f * 2.0f * 0.968f * 1000.0f + 0.5f);
+  if (mv < BATTERY_MIN_MV || mv > BATTERY_MAX_MV) {
+    return 0;
+  }
+  return mv;
+}
+
+// Update the charging state from the voltage step since the previous wake
+void updateChargingState(int batteryMv) {
+  if (batteryMv > 0 && previousBatteryMv > 0) {
+    int step = batteryMv - previousBatteryMv;
+    if (step > CHARGING_STEP_MV) {
+      chargingState = 1;
+    } else if (step < -CHARGING_STEP_MV) {
+      chargingState = 0;
+    }
+  }
+  previousBatteryMv = batteryMv;
+}
+
 // Read setting from ESP32 NVS
 String loadPreference(const char* key, const char* defaultVal) {
   Preferences p;
@@ -61,8 +115,10 @@ void savePreferences(const String& user, const String& srv) {
   Serial.printf("Saved to NVS: username='%s', server='%s'\n", user.c_str(), srv.c_str());
 }
 
-// Build final image URL based on server and username
-String buildImageUrl(String srv, const String& user) {
+// Build final image URL based on server, username and battery status.
+// batteryMv <= 0 leaves out both battery parameters; an unknown charging
+// state leaves out only the charging parameter.
+String buildImageUrl(String srv, const String& user, int batteryMv, int charging) {
   srv.trim();
   if (srv.length() == 0) {
     srv = DEFAULT_SERVER;
@@ -77,8 +133,20 @@ String buildImageUrl(String srv, const String& user) {
   }
 
   String url = srv + "/clock.png";
+  char sep = '?';
   if (user.length() > 0) {
-    url += "?user=" + user;
+    url += sep;
+    url += "user=" + user;
+    sep = '&';
+  }
+  if (batteryMv > 0) {
+    url += sep;
+    url += "battery_mv=" + String(batteryMv);
+    sep = '&';
+    if (charging != CHARGING_UNKNOWN) {
+      url += sep;
+      url += "charging=" + String(charging);
+    }
   }
   return url;
 }
@@ -167,6 +235,16 @@ void setup() {
   }
 
   delay(500);
+
+  // Read the battery once per wake, before Wi-Fi starts
+  int batteryMv = readBatteryMv();
+  updateChargingState(batteryMv);
+  if (batteryMv > 0) {
+    Serial.printf("Battery: %d mV | Charging: %s\n", batteryMv,
+                  chargingState == CHARGING_UNKNOWN ? "unknown" : (chargingState ? "yes" : "no"));
+  } else {
+    Serial.println("Battery: reading failed or out of range, not reported");
+  }
 
   if (forceConfigPortal) {
     Serial.println("Setup button pressed twice. Forcing config portal...");
@@ -268,7 +346,7 @@ void setup() {
   configTime(0, 0, "pool.ntp.org", "time.google.com");
 
   // Construct URL to fetch image
-  String imageUrl = buildImageUrl(server, username);
+  String imageUrl = buildImageUrl(server, username, batteryMv, chargingState);
   Serial.println("Fetching image from: " + imageUrl);
 
   HTTPClient http;

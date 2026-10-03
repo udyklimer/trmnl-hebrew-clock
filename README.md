@@ -64,10 +64,29 @@ The portal also opens by itself if Wi-Fi is connected but no user name has been 
 On each wake the firmware:
 
 1. Loads the user name and server URL from flash (NVS).
-2. Connects to Wi-Fi with WiFiManager.
-3. Downloads `<server>/clock.png?user=<user name>`.
-4. Decodes the PNG, converts each pixel to black or white and draws it with a full display refresh.
-5. Reads the time over NTP and sleeps until about 2 seconds before the next minute, so the next image is on screen as the minute changes. If NTP is unavailable it sleeps for 60 seconds.
+2. Reads the battery voltage.
+3. Connects to Wi-Fi with WiFiManager.
+4. Downloads the clock image, reporting the battery status in the request (see below).
+5. Decodes the PNG, converts each pixel to black or white and draws it with a full display refresh.
+6. Reads the time over NTP and sleeps until about 2 seconds before the next minute, so the next image is on screen as the minute changes. If NTP is unavailable it sleeps for 60 seconds.
+
+## Image request and battery status
+
+The image is requested from:
+
+```
+<server>/clock.png?user=<user name>&battery_mv=<millivolts>&charging=<0|1>
+```
+
+- `user`: the user name set in the setup portal.
+- `battery_mv`: the battery voltage in millivolts, for example `4063`. It is measured once per wake, before Wi-Fi starts. The device sends the voltage only; the server turns it into a percentage.
+- `charging`: `1` when the device believes USB power is connected, `0` when it believes it is not.
+
+Both battery parameters are optional. If the reading fails or is outside 2500 to 4500 mV, neither is sent. `charging` is left out while the device does not know the state.
+
+The board has no charge-status pin, so `charging` is worked out from the voltage: USB power raises the reading by about 50 mV. A rise of more than 30 mV since the previous wake sets it to `1`, and a drop of more than 30 mV sets it to `0`. After power-on or a reset the state is unknown until the first such step, which means plugging or unplugging USB once.
+
+Whether and how the battery is shown on the clock is chosen on the server's settings page.
 
 ## Server requirements
 
