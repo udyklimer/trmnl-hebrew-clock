@@ -1,0 +1,82 @@
+# Build, sign and publish a firmware release when a tag vX.Y.Z is pushed.
+# The release gets exactly two assets, firmware.bin and firmware.bin.sig,
+# which the clock server offers to devices as an over-the-air update.
+name: Release firmware
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from tag
+        id: version
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag $GITHUB_REF_NAME is not of the form vX.Y.Z" >&2
+            exit 1
+          fi
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: platformio-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build
+        env:
+          PLATFORMIO_BUILD_FLAGS: -DFW_VERSION='"${{ steps.version.outputs.version }}"'
+        run: |
+          pio run
+          cp .pio/build/seeed_xiao_esp32s3/firmware.bin firmware.bin
+
+      - name: Sign
+        env:
+          FIRMWARE_SIGNING_KEY: ${{ secrets.FIRMWARE_SIGNING_KEY }}
+        run: |
+          if [ -z "$FIRMWARE_SIGNING_KEY" ]; then
+            echo "The FIRMWARE_SIGNING_KEY secret is not set" >&2
+            exit 1
+          fi
+          umask 077
+          key="$RUNNER_TEMP/signing_key.pem"
+          printf '%s\n' "$FIRMWARE_SIGNING_KEY" > "$key"
+
+          # The device only accepts signatures from the public key compiled into
+          # it, so refuse to release if the secret does not match that key
+          sed -n '/BEGIN PUBLIC KEY/,/END PUBLIC KEY/p' include/firmware_signing_key.h \
+            | sed 's/^.*-----BEGIN/-----BEGIN/' > "$RUNNER_TEMP/header_key.pem"
+          if ! cmp -s <(openssl pkey -in "$key" -pubout -outform DER) \
+                      <(openssl pkey -pubin -in "$RUNNER_TEMP/header_key.pem" -outform DER); then
+            rm -f "$key"
+            echo "FIRMWARE_SIGNING_KEY does not match the public key in include/firmware_signing_key.h" >&2
+            exit 1
+          fi
+
+          # DER-encoded ECDSA P-256 signature of the SHA-256 of the binary
+          openssl dgst -sha256 -sign "$key" -out firmware.bin.sig firmware.bin
+          rm -f "$key"
+          openssl dgst -sha256 -verify "$RUNNER_TEMP/header_key.pem" -signature firmware.bin.sig firmware.bin
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" firmware.bin firmware.bin.sig \
+            --title "Firmware ${{ steps.version.outputs.version }}" \
+            --generate-notes

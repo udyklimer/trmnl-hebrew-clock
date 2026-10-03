@@ -8,6 +8,7 @@
 #include <Preferences.h>
 #include <time.h>
 #include <driver/rtc_io.h>
+#include "firmware_update.h"
 
 // KEY1 on the TRMNL OG DIY Kit (D1, active low). KEY2 is D2 and KEY3 is D4.
 // One press wakes the device from deep sleep (handy before a firmware upload);
@@ -53,6 +54,8 @@ const char* DEFAULT_SERVER = "https://clock.udyklimer.com";
 // wake-to-wake noise is under 10 mV, so a step larger than this means USB was
 // plugged in (rise) or unplugged (drop).
 #define CHARGING_STEP_MV 30
+// Firmware updates are installed only on USB power or above this battery level
+#define OTA_MIN_BATTERY_MV 3700
 
 // Kept across deep sleep to compare each wake with the previous one
 #define CHARGING_UNKNOWN -1
@@ -115,10 +118,8 @@ void savePreferences(const String& user, const String& srv) {
   Serial.printf("Saved to NVS: username='%s', server='%s'\n", user.c_str(), srv.c_str());
 }
 
-// Build final image URL based on server, username and battery status.
-// batteryMv <= 0 leaves out both battery parameters; an unknown charging
-// state leaves out only the charging parameter.
-String buildImageUrl(String srv, const String& user, int batteryMv, int charging) {
+// Normalize the configured server address into a base URL without trailing slash
+String normalizeServerUrl(String srv) {
   srv.trim();
   if (srv.length() == 0) {
     srv = DEFAULT_SERVER;
@@ -131,14 +132,23 @@ String buildImageUrl(String srv, const String& user, int batteryMv, int charging
   while (srv.endsWith("/")) {
     srv.remove(srv.length() - 1);
   }
+  return srv;
+}
 
-  String url = srv + "/clock.png";
+// Build final image URL based on server, username, firmware version and battery status.
+// batteryMv <= 0 leaves out both battery parameters; an unknown charging
+// state leaves out only the charging parameter.
+String buildImageUrl(const String& srv, const String& user, int batteryMv, int charging) {
+  String url = normalizeServerUrl(srv) + "/clock.png";
   char sep = '?';
   if (user.length() > 0) {
     url += sep;
     url += "user=" + user;
     sep = '&';
   }
+  url += sep;
+  url += "fw=" FW_VERSION;
+  sep = '&';
   if (batteryMv > 0) {
     url += sep;
     url += "battery_mv=" + String(batteryMv);
@@ -363,9 +373,14 @@ void setup() {
     httpBeginSuccess = http.begin(standardClient, imageUrl);
   }
 
+  bool imageShown = false;
+  FirmwareOffer firmwareOffer;
+
   if (httpBeginSuccess) {
+    collectFirmwareHeaders(http);
     int httpCode = http.GET();
     if (httpCode == HTTP_CODE_OK) {
+      firmwareOffer = readFirmwareOffer(http);
       int len = http.getSize();
       if (len > 0) {
         uint8_t* buffer = (uint8_t*)malloc(len);
@@ -377,13 +392,15 @@ void setup() {
           Serial.println("Display: Full refresh (fast OTP waveform)...");
           display.setFullWindow();
           display.firstPage();
+          int rc;
           do {
             display.fillScreen(GxEPD_WHITE);
-            int rc = png.openRAM(buffer, len, pngDraw);
+            rc = png.openRAM(buffer, len, pngDraw);
             if (rc == PNG_SUCCESS) { png.decode(NULL, 0); png.close(); }
           } while (display.nextPage());
 
           free(buffer);
+          imageShown = (rc == PNG_SUCCESS);
           Serial.println("Display update complete!");
         } else {
           Serial.println("Error: Failed to allocate memory for image buffer");
@@ -401,6 +418,22 @@ void setup() {
 
   // Turn off display power to preserve battery and maintain image state
   display.powerOff();
+
+  // This firmware works: keep it, even if it was just installed over the air
+  if (imageShown) {
+    confirmRunningFirmware();
+  }
+
+  // Install an offered update only now, so a slow download never delays the minute.
+  // Returns only if nothing was installed; on success the device restarts.
+  if (imageShown && firmwareOffer.present) {
+    if (chargingState == 1 || batteryMv >= OTA_MIN_BATTERY_MV) {
+      installFirmwareUpdate(firmwareOffer, normalizeServerUrl(server));
+    } else {
+      Serial.printf("OTA: %s offered, waiting for USB power or %d mV battery\n",
+                    firmwareOffer.version.c_str(), OTA_MIN_BATTERY_MV);
+    }
+  }
 
   // Calculate sleep duration to wake up right at the next minute boundary.
   // We subtract DISPLAY_UPDATE_SEC so the display finishes updating before the minute ticks.
