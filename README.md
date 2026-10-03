@@ -20,7 +20,7 @@ Display wiring used by the firmware:
 | SCK         | 7    |
 | MOSI        | 9    |
 
-The `KEY1` button (pin `D1`, GPIO 2) is used as the setup button.
+The `KEY1` button (pin `D1`, GPIO 2) is used as the setup button. The `KEY2` button (pin `D2`, GPIO 3) refreshes the clock on demand.
 
 ## Build and flash
 
@@ -50,6 +50,10 @@ The portal closes after 3 minutes without input. The device then sleeps for a mi
 Press the `KEY1` button twice, with the second press within 3 seconds of the first. The first press wakes the device; the second makes it show the "WiFi Setup Mode" screen and open the `HebrewClock-Setup` portal again, with the current values filled in.
 
 A single press only wakes the device, which then refreshes the clock as usual. This is useful for waking it before uploading new firmware.
+
+### Refreshing on demand
+
+Press the `KEY2` button once. The device wakes, downloads the current image and shows it straight away, without waiting for the minute to end. Use it after changing your settings on the server. The device then goes back to its normal rhythm and refreshes again when the minute changes.
 
 The portal also opens when the saved Wi-Fi network cannot be reached: on its next wake the device tries the network for 10 seconds and then falls back to the portal.
 

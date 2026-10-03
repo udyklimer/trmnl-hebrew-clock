@@ -15,6 +15,10 @@
 #define SETUP_BUTTON D1
 #define SETUP_PRESS_WINDOW_MS 3000
 
+// KEY2 (D2, active low): one press wakes the device and refreshes the clock
+// right away, e.g. after changing the settings on the server.
+#define REFRESH_BUTTON D2
+
 // Official pin setup for Seeed Studio / TRMNL OG DIY Kit
 #define EPD_BUSY 4   // GPIO 4
 #define EPD_RST  38  // GPIO 38
@@ -79,12 +83,15 @@ String buildImageUrl(String srv, const String& user) {
   return url;
 }
 
-// Deep sleep for the given time, waking early if the setup button is pressed
+// Deep sleep for the given time, waking early if either button is pressed
 void enterDeepSleep(uint32_t seconds) {
-  // Keep the button pulled up while sleeping so only a press pulls it low
+  // Keep the buttons pulled up while sleeping so only a press pulls them low
   rtc_gpio_pullup_en((gpio_num_t)SETUP_BUTTON);
   rtc_gpio_pulldown_dis((gpio_num_t)SETUP_BUTTON);
   esp_sleep_enable_ext0_wakeup((gpio_num_t)SETUP_BUTTON, 0);
+  rtc_gpio_pullup_en((gpio_num_t)REFRESH_BUTTON);
+  rtc_gpio_pulldown_dis((gpio_num_t)REFRESH_BUTTON);
+  esp_sleep_enable_ext1_wakeup(1ULL << REFRESH_BUTTON, ESP_EXT1_WAKEUP_ANY_LOW);
   esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
   esp_deep_sleep_start();
 }
@@ -151,14 +158,23 @@ void setup() {
   // If the setup button woke us, a second press opens the config portal
   rtc_gpio_deinit((gpio_num_t)SETUP_BUTTON);
   pinMode(SETUP_BUTTON, INPUT_PULLUP);
+  rtc_gpio_deinit((gpio_num_t)REFRESH_BUTTON);
+  pinMode(REFRESH_BUTTON, INPUT_PULLUP);
+  esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
   bool forceConfigPortal = false;
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+  if (wakeCause == ESP_SLEEP_WAKEUP_EXT0) {
     forceConfigPortal = waitForSecondPress();
   }
 
   delay(500);
+
   if (forceConfigPortal) {
     Serial.println("Setup button pressed twice. Forcing config portal...");
+  }
+  if (wakeCause == ESP_SLEEP_WAKEUP_EXT1) {
+    // Nothing special to do: every wake fetches a fresh image and then sleeps
+    // until the next minute boundary, which is exactly what a refresh needs.
+    Serial.println("Refresh button pressed. Refreshing now...");
   }
 
   // Initialize SPI bus for display
