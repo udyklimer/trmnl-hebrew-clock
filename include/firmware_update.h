@@ -19,8 +19,9 @@ struct FirmwareOffer {
   String signature;  // base64 of a DER ECDSA P-256 / SHA-256 signature
 };
 
-// Call on the image request before GET() so the offer headers are kept
-void collectFirmwareHeaders(HTTPClient& http);
+// Call on the image request before GET() so the offer headers are kept,
+// together with up to 4 extra response headers the caller wants to read
+void collectFirmwareHeaders(HTTPClient& http, const char* const extraHeaders[] = nullptr, size_t extraCount = 0);
 
 // Read the offer headers after GET(); present is false if there is none
 FirmwareOffer readFirmwareOffer(HTTPClient& http);

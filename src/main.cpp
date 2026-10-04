@@ -9,6 +9,10 @@
 #include <time.h>
 #include <driver/rtc_io.h>
 #include "firmware_update.h"
+#include "wifi_networks.h"
+#include <Fonts/FreeSansBold24pt7b.h>
+#include <Fonts/FreeSansBold18pt7b.h>
+#include <Fonts/FreeSans12pt7b.h>
 
 // KEY1 on the TRMNL OG DIY Kit (D1, active low). KEY2 is D2 and KEY3 is D4.
 // One press wakes the device from deep sleep (handy before a firmware upload);
@@ -39,6 +43,16 @@ PNG png;
 const char* DEFAULT_SERVER = "https://clock.udyklimer.com";
 #define SLEEP_FALLBACK_SEC 60       // Fallback if NTP sync fails
 #define DISPLAY_UPDATE_SEC 2        // Buffer: seconds the display update takes
+
+#define WIFI_CONNECT_TIMEOUT_MS 10000   // Per network, on each connection attempt
+#define SETUP_PORTAL_TIMEOUT_SEC 180    // The portal closes after this long without use
+#define PORTAL_RETRY_INTERVAL_MS 30000  // While the portal is open after Wi-Fi was lost
+
+// Time zone for the clock the device draws itself when the server can't be
+// reached (POSIX TZ format). Defaults to Israel; the server can override it
+// with an X-Clock-Timezone header, which is remembered across deep sleep.
+#define DEFAULT_TIMEZONE "IST-2IDT,M3.4.4/26,M10.5.0"
+RTC_DATA_ATTR char clockTimezone[48] = DEFAULT_TIMEZONE;
 
 // Always use full refresh with the GDEY075T7's fast OTP waveform (~1.2s).
 // Partial refresh on this panel accumulates ghosting that only a full refresh clears.
@@ -191,13 +205,23 @@ bool waitForSecondPress() {
   return false;
 }
 
-void showSetupScreen() {
+// Hotspot name with the end of the MAC address, so nearby clocks can be told apart
+String setupHotspotName() {
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);  // Works before Wi-Fi is started
+  char name[32];
+  snprintf(name, sizeof(name), "HebrewClock-Setup-%02X%02X", mac[4], mac[5]);
+  return String(name);
+}
+
+void showSetupScreen(const String& hotspotName) {
   display.setFullWindow();
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
     display.drawRect(20, 20, display.width() - 40, display.height() - 40, GxEPD_BLACK);
-    
+
+    display.setFont(NULL);
     display.setTextColor(GxEPD_BLACK);
     display.setTextSize(3);
     display.setCursor(60, 100);
@@ -207,10 +231,51 @@ void showSetupScreen() {
     display.setCursor(60, 180);
     display.print("1. Connect to Wi-Fi:");
     display.setCursor(80, 220);
-    display.print("   'HebrewClock-Setup'");
+    display.print("   '" + hotspotName + "'");
 
     display.setCursor(60, 280);
     display.print("2. Configure WiFi & Username");
+  } while (display.nextPage());
+}
+
+// Print text horizontally centered with its baseline at y
+void printCentered(const char* text, int16_t y) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(text, 0, y, &x1, &y1, &w, &h);
+  display.setCursor((display.width() - w) / 2 - x1, y);
+  display.print(text);
+}
+
+// Shown when Wi-Fi works but the clock image can't be fetched: the device
+// draws the time itself, if it knows it, with the reason underneath
+void showOfflineScreen(const char* message) {
+  char clockText[8] = "";
+  time_t now = time(nullptr);
+  if (now > 1700000000) {  // The time was set by NTP since the last reset
+    // We wake just before the minute changes, so show the minute about to start
+    time_t shown = now + DISPLAY_UPDATE_SEC + 3;
+    struct tm t;
+    localtime_r(&shown, &t);
+    snprintf(clockText, sizeof(clockText), "%02d:%02d", t.tm_hour, t.tm_min);
+  }
+
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setTextColor(GxEPD_BLACK);
+    if (clockText[0]) {
+      display.setFont(&FreeSansBold24pt7b);
+      display.setTextSize(3);
+      printCentered(clockText, 220);
+    }
+    display.setTextSize(1);
+    display.setFont(&FreeSansBold18pt7b);
+    printCentered(message, clockText[0] ? 330 : 230);
+    display.setFont(&FreeSans12pt7b);
+    printCentered("Retrying every minute", clockText[0] ? 380 : 280);
+    display.setFont(NULL);
   } while (display.nextPage());
 }
 
@@ -279,8 +344,8 @@ void setup() {
   String server = loadPreference("server", DEFAULT_SERVER);
 
   WiFiManager wm;
-  wm.setConnectTimeout(10);
-  wm.setConfigPortalTimeout(180);
+  wm.setConnectTimeout(WIFI_CONNECT_TIMEOUT_MS / 1000);
+  wm.setConfigPortalTimeout(SETUP_PORTAL_TIMEOUT_SEC);
 
   // Setup custom WiFiManager parameters
   char custom_username_buf[64] = {0};
@@ -304,29 +369,59 @@ void setup() {
     configSaved = true;
   });
 
-  bool portalShown = false;
-  wm.setAPCallback([&portalShown](WiFiManager *myWiFiManager) {
-    Serial.println("Could not connect to saved WiFi. Opening Config Portal...");
-    portalShown = true;
-    showSetupScreen();
-  });
+  String hotspotName = setupHotspotName();
+  migrateStoredNetwork();
+
+  // Run the setup portal until a network is entered, the settings are saved,
+  // or it times out. With retrySaved, saved networks are also tried every
+  // PORTAL_RETRY_INTERVAL_MS, so a router that is just restarting is picked
+  // up again without anyone touching the portal.
+  auto runSetupPortal = [&](bool retrySaved) -> bool {
+    configSaved = false;  // Only a save in this portal session closes it
+    showSetupScreen(hotspotName);
+    wm.setConfigPortalBlocking(false);
+    wm.startConfigPortal(hotspotName.c_str());
+    unsigned long lastRetry = millis();
+    while (wm.getConfigPortalActive()) {
+      if (wm.process()) break;  // Connected to a newly entered network
+      if (configSaved) {        // Settings saved without a new network
+        wm.stopConfigPortal();
+        break;
+      }
+      if (retrySaved && millis() - lastRetry > PORTAL_RETRY_INTERVAL_MS) {
+        Serial.println("Portal open, checking for saved networks in range...");
+        if (connectToSavedNetworkInRange(WIFI_CONNECT_TIMEOUT_MS)) {
+          Serial.println("Saved network is back. Closing Config Portal...");
+          wm.stopConfigPortal();
+          break;
+        }
+        lastRetry = millis();
+      }
+      delay(10);
+    }
+    // One more try with the saved networks once the portal has closed
+    return WiFi.status() == WL_CONNECTED || connectToSavedNetwork(WIFI_CONNECT_TIMEOUT_MS);
+  };
 
   bool connected = false;
   if (forceConfigPortal) {
-    portalShown = true;
-    showSetupScreen();
-    connected = wm.startConfigPortal("HebrewClock-Setup");
+    connected = runSetupPortal(false);
   } else {
-    // Attempt auto-connect to saved WiFi, fallback to Access Point if connection fails
-    connected = wm.autoConnect("HebrewClock-Setup");
+    connected = connectToSavedNetwork(WIFI_CONNECT_TIMEOUT_MS);
+    if (!connected) {
+      Serial.println("Could not connect to a saved network. Opening Config Portal...");
+      connected = runSetupPortal(savedNetworkCount() > 0);
+    }
   }
 
   // If connected to Wi-Fi but username has never been configured, force portal open
   if (connected && username.length() == 0 && strlen(custom_username.getValue()) == 0) {
     Serial.println("Username not yet configured. Opening Config Portal...");
-    portalShown = true;
-    showSetupScreen();
-    connected = wm.startConfigPortal("HebrewClock-Setup");
+    connected = runSetupPortal(false);
+  }
+
+  if (connected) {
+    rememberConnectedNetwork();
   }
 
   // Retrieve values from custom fields
@@ -353,7 +448,7 @@ void setup() {
   Serial.printf("Configured User: '%s' | Server: '%s'\n", username.c_str(), server.c_str());
 
   // Sync time via NTP so we can sleep until the next exact minute boundary
-  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  configTzTime(clockTimezone, "pool.ntp.org", "time.google.com");
 
   // Construct URL to fetch image
   String imageUrl = buildImageUrl(server, username, batteryMv, chargingState);
@@ -375,45 +470,68 @@ void setup() {
 
   bool imageShown = false;
   FirmwareOffer firmwareOffer;
+  char failure[48] = "";
 
   if (httpBeginSuccess) {
-    collectFirmwareHeaders(http);
+    static const char* const clockHeaders[] = {"X-Clock-Timezone"};
+    collectFirmwareHeaders(http, clockHeaders, 1);
     int httpCode = http.GET();
     if (httpCode == HTTP_CODE_OK) {
       firmwareOffer = readFirmwareOffer(http);
-      int len = http.getSize();
-      if (len > 0) {
-        uint8_t* buffer = (uint8_t*)malloc(len);
-        if (buffer) {
-          WiFiClient* stream = http.getStreamPtr();
-          stream->readBytes(buffer, len);
 
-          // Full refresh every time using the panel's fast OTP waveform (~1.2s, ghost-free)
-          Serial.println("Display: Full refresh (fast OTP waveform)...");
-          display.setFullWindow();
-          display.firstPage();
-          int rc;
-          do {
-            display.fillScreen(GxEPD_WHITE);
-            rc = png.openRAM(buffer, len, pngDraw);
-            if (rc == PNG_SUCCESS) { png.decode(NULL, 0); png.close(); }
-          } while (display.nextPage());
-
-          free(buffer);
-          imageShown = (rc == PNG_SUCCESS);
-          Serial.println("Display update complete!");
-        } else {
-          Serial.println("Error: Failed to allocate memory for image buffer");
-        }
-      } else {
-        Serial.printf("Invalid image length: %d\n", len);
+      String tz = http.header("X-Clock-Timezone");
+      tz.trim();
+      if (tz.length() > 0 && tz.length() < sizeof(clockTimezone) && tz != clockTimezone) {
+        strlcpy(clockTimezone, tz.c_str(), sizeof(clockTimezone));
+        setenv("TZ", clockTimezone, 1);
+        tzset();
+        Serial.printf("Clock time zone set to %s\n", clockTimezone);
       }
+
+      int len = http.getSize();
+      uint8_t* buffer = len > 0 ? (uint8_t*)malloc(len) : nullptr;
+      if (buffer == nullptr) {
+        Serial.printf("Invalid image length or out of memory: %d\n", len);
+        strlcpy(failure, "Invalid image from server", sizeof(failure));
+      } else if (http.getStreamPtr()->readBytes(buffer, len) != (size_t)len) {
+        Serial.println("Image download incomplete");
+        strlcpy(failure, "No internet", sizeof(failure));
+      } else if (png.openRAM(buffer, len, pngDraw) != PNG_SUCCESS) {
+        // E.g. a hotel or captive-portal network answering with a web page
+        Serial.println("Downloaded file is not a PNG");
+        strlcpy(failure, "Invalid image from server", sizeof(failure));
+      } else {
+        png.close();
+        // Full refresh every time using the panel's fast OTP waveform (~1.2s, ghost-free)
+        Serial.println("Display: Full refresh (fast OTP waveform)...");
+        display.setFullWindow();
+        display.firstPage();
+        int rc;
+        do {
+          display.fillScreen(GxEPD_WHITE);
+          rc = png.openRAM(buffer, len, pngDraw);
+          if (rc == PNG_SUCCESS) { png.decode(NULL, 0); png.close(); }
+        } while (display.nextPage());
+        imageShown = (rc == PNG_SUCCESS);
+        Serial.println("Display update complete!");
+      }
+      free(buffer);
+    } else if (httpCode < 0) {
+      // No connection to the server at all: DNS, TCP or TLS failed, or timed out
+      Serial.printf("HTTP GET failed: %s\n", HTTPClient::errorToString(httpCode).c_str());
+      strlcpy(failure, "No internet", sizeof(failure));
     } else {
       Serial.printf("HTTP GET failed, error code: %d\n", httpCode);
+      snprintf(failure, sizeof(failure), "Server error (HTTP %d)", httpCode);
     }
     http.end();
   } else {
     Serial.println("HTTP begin failed!");
+    strlcpy(failure, "No internet", sizeof(failure));
+  }
+
+  if (!imageShown) {
+    showOfflineScreen(failure[0] ? failure : "No internet");
   }
 
   // Turn off display power to preserve battery and maintain image state

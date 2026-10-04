@@ -39,7 +39,7 @@ The first firmware with over-the-air update support has to be flashed by cable. 
 
 ## First-time setup
 
-1. Power the device. With no saved Wi-Fi network it shows a "WiFi Setup Mode" screen and opens an access point named `HebrewClock-Setup`.
+1. Power the device. With no saved Wi-Fi network it shows a "WiFi Setup Mode" screen and opens an access point named `HebrewClock-Setup-XXXX`, where `XXXX` is the end of the device's MAC address, so several clocks in one place can be told apart. The exact name is shown on the screen.
 2. Connect to that access point from a phone or computer and open the configuration page.
 3. Choose your Wi-Fi network and enter its password.
 4. Fill in the two extra fields:
@@ -47,11 +47,11 @@ The first firmware with over-the-air update support has to be flashed by cable. 
    - **Server URL**: the clock server address. Defaults to `https://clock.udyklimer.com`. If you leave out the scheme, `https://` is assumed.
 5. Save. The device connects and shows the clock.
 
-The portal closes after 3 minutes without input. The device then sleeps for a minute and tries again.
+The portal closes after 3 minutes without input. The device then sleeps for a minute and tries again. Saving only the user name or server URL closes the portal straight away.
 
 ### Changing the settings later
 
-Press the `KEY1` button twice, with the second press within 3 seconds of the first. The first press wakes the device; the second makes it show the "WiFi Setup Mode" screen and open the `HebrewClock-Setup` portal again, with the current values filled in.
+Press the `KEY1` button twice, with the second press within 3 seconds of the first. The first press wakes the device; the second makes it show the "WiFi Setup Mode" screen and open the setup portal again, with the current values filled in.
 
 A single press only wakes the device, which then refreshes the clock as usual. This is useful for waking it before uploading new firmware.
 
@@ -59,9 +59,25 @@ A single press only wakes the device, which then refreshes the clock as usual. T
 
 Press the `KEY2` button once. The device wakes, downloads the current image and shows it straight away, without waiting for the minute to end. Use it after changing your settings on the server. The device then goes back to its normal rhythm and refreshes again when the minute changes.
 
-The portal also opens when the saved Wi-Fi network cannot be reached: on its next wake the device tries the network for 10 seconds and then falls back to the portal.
-
 The portal also opens by itself if Wi-Fi is connected but no user name has been set.
+
+## Wi-Fi
+
+### Several networks
+
+The device remembers the last 5 Wi-Fi networks it connected to. Taking it to another place and back works without setting it up again: on each wake it tries the network it used last, and if that fails, any other remembered network that is in range. Each attempt waits up to 10 seconds.
+
+### When Wi-Fi is lost
+
+If no remembered network can be reached, the device shows the "WiFi Setup Mode" screen and opens the setup portal, as on first setup. While the portal is open it keeps checking every 30 seconds whether a remembered network is back in range, for example after a router restart, and if so closes the portal and shows the clock again.
+
+The portal closes after 3 minutes without use. The device then sleeps for a minute and starts over, so it keeps trying for as long as the outage lasts. Note that this cycle keeps the radio on most of the time, which drains the battery much faster than normal operation.
+
+### When there is no internet
+
+If Wi-Fi is connected but the clock image can't be downloaded, the device draws the time itself, with the reason underneath ("No internet", "Server error (HTTP 500)" or "Invalid image from server"), and tries again every minute.
+
+The device's own time comes from the last successful time sync. It is lost on a reset, in which case only the message is shown, and it drifts slowly during a long outage, since the board keeps time with its internal oscillator. The time zone defaults to Israel; a server can change it with an `X-Clock-Timezone` response header in POSIX TZ format (for example `IST-2IDT,M3.4.4/26,M10.5.0`).
 
 ## How it works
 
@@ -69,11 +85,11 @@ On each wake the firmware:
 
 1. Loads the user name and server URL from flash (NVS).
 2. Reads the battery voltage.
-3. Connects to Wi-Fi with WiFiManager.
+3. Connects to one of the remembered Wi-Fi networks, or opens the setup portal (see [Wi-Fi](#wi-fi)).
 4. Downloads the clock image, reporting the battery status in the request (see below).
-5. Decodes the PNG, converts each pixel to black or white and draws it with a full display refresh.
+5. Decodes the PNG, converts each pixel to black or white and draws it with a full display refresh. If the image can't be downloaded, it draws the time itself instead (see [When there is no internet](#when-there-is-no-internet)).
 6. Confirms the running firmware, and installs a firmware update if the server offered one (see [Firmware updates](#firmware-updates)).
-7. Reads the time over NTP and sleeps until about 2 seconds before the next minute, so the next image is on screen as the minute changes. If NTP is unavailable it sleeps for 60 seconds.
+7. Syncs the time over NTP and sleeps until about 2 seconds before the next minute, so the next image is on screen as the minute changes. If NTP is unavailable it sleeps for 60 seconds.
 
 ## Image request and battery status
 

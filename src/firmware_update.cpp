@@ -40,8 +40,14 @@ static const char* OFFER_HEADERS[] = {
   "X-Firmware-Sha256", "X-Firmware-Signature"
 };
 
-void collectFirmwareHeaders(HTTPClient& http) {
-  http.collectHeaders(OFFER_HEADERS, sizeof(OFFER_HEADERS) / sizeof(OFFER_HEADERS[0]));
+void collectFirmwareHeaders(HTTPClient& http, const char* const extraHeaders[], size_t extraCount) {
+  // collectHeaders() replaces any earlier list, so the caller's headers go in the same call
+  const size_t offerCount = sizeof(OFFER_HEADERS) / sizeof(OFFER_HEADERS[0]);
+  const char* headers[offerCount + 4];
+  size_t count = 0;
+  for (size_t i = 0; i < offerCount; i++) headers[count++] = OFFER_HEADERS[i];
+  for (size_t i = 0; i < extraCount && count < sizeof(headers) / sizeof(headers[0]); i++) headers[count++] = extraHeaders[i];
+  http.collectHeaders(headers, count);
 }
 
 FirmwareOffer readFirmwareOffer(HTTPClient& http) {
