@@ -10,6 +10,9 @@
 #include <driver/rtc_io.h>
 #include "firmware_update.h"
 #include "wifi_networks.h"
+#include "image_batch.h"
+#include <esp_sntp.h>
+#include <sys/time.h>
 #include <Fonts/FreeSansBold24pt7b.h>
 #include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSans12pt7b.h>
@@ -47,6 +50,18 @@ const char* DEFAULT_SERVER = "https://clock.udyklimer.com";
 #define WIFI_CONNECT_TIMEOUT_MS 10000   // Per network, on each connection attempt
 #define SETUP_PORTAL_TIMEOUT_SEC 180    // The portal closes after this long without use
 #define PORTAL_RETRY_INTERVAL_MS 30000  // While the portal is open after Wi-Fi was lost
+#define NTP_TIMEOUT_MS 5000             // How long a fetch wake waits for the time sync
+#define MAX_BATCH_MINUTES 15            // Upper limit for the server's X-Batch-Minutes
+
+// Time of the last NTP sync, to report how far the internal clock drifts between syncs
+RTC_DATA_ATTR time_t lastClockSync = 0;
+
+// Per-wake measurements, printed in one [TIMING] line just before deep sleep
+static const char* wakeType = "fetch";
+static long wifiMs = -1;
+static long ntpMs = -1;
+static long displayMs = -1;
+static String downloadMs;  // Comma-separated, one entry per image download
 
 // Time zone for the clock the device draws itself when the server can't be
 // reached (POSIX TZ format). Defaults to Israel; the server can override it
@@ -151,8 +166,9 @@ String normalizeServerUrl(String srv) {
 
 // Build final image URL based on server, username, firmware version and battery status.
 // batteryMv <= 0 leaves out both battery parameters; an unknown charging
-// state leaves out only the charging parameter.
-String buildImageUrl(const String& srv, const String& user, int batteryMv, int charging) {
+// state leaves out only the charging parameter. at != 0 asks for the minute
+// containing that Unix time instead of the current one.
+String buildImageUrl(const String& srv, const String& user, int batteryMv, int charging, time_t at) {
   String url = normalizeServerUrl(srv) + "/clock.png";
   char sep = '?';
   if (user.length() > 0) {
@@ -172,11 +188,17 @@ String buildImageUrl(const String& srv, const String& user, int batteryMv, int c
       url += "charging=" + String(charging);
     }
   }
+  if (at != 0) {
+    url += "&at=" + String((unsigned long)at);
+  }
   return url;
 }
 
 // Deep sleep for the given time, waking early if either button is pressed
-void enterDeepSleep(uint32_t seconds) {
+void deepSleepMicros(uint64_t micros) {
+  Serial.printf("[TIMING] wake=%s wifi=%ldms ntp=%ldms downloads=[%s]ms display=%ldms total=%lums\n",
+                wakeType, wifiMs, ntpMs, downloadMs.c_str(), displayMs, millis());
+  Serial.flush();
   // Keep the buttons pulled up while sleeping so only a press pulls them low
   rtc_gpio_pullup_en((gpio_num_t)SETUP_BUTTON);
   rtc_gpio_pulldown_dis((gpio_num_t)SETUP_BUTTON);
@@ -184,8 +206,76 @@ void enterDeepSleep(uint32_t seconds) {
   rtc_gpio_pullup_en((gpio_num_t)REFRESH_BUTTON);
   rtc_gpio_pulldown_dis((gpio_num_t)REFRESH_BUTTON);
   esp_sleep_enable_ext1_wakeup(1ULL << REFRESH_BUTTON, ESP_EXT1_WAKEUP_ANY_LOW);
-  esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
+  esp_sleep_enable_timer_wakeup(micros);
   esp_deep_sleep_start();
+}
+
+void enterDeepSleep(uint32_t seconds) {
+  deepSleepMicros((uint64_t)seconds * 1000000ULL);
+}
+
+// Sleep until DISPLAY_UPDATE_SEC before the next minute starts, so the next
+// image is on screen as the minute changes
+void sleepUntilNextMinute() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  if (tv.tv_sec < 1700000000) {
+    Serial.printf("Time unknown. Falling back to %u sec sleep.\n", SLEEP_FALLBACK_SEC);
+    enterDeepSleep(SLEEP_FALLBACK_SEC);
+  }
+  int64_t nowUs = (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec;
+  int64_t targetSec = (tv.tv_sec / 60 + 1) * 60 - DISPLAY_UPDATE_SEC;
+  if ((int64_t)targetSec * 1000000LL - nowUs < 500000LL) targetSec += 60;  // Too close, take the next one
+  int64_t sleepUs = (int64_t)targetSec * 1000000LL - nowUs;
+
+  struct tm t;
+  localtime_r(&tv.tv_sec, &t);
+  Serial.printf("Time: %02d:%02d:%02d | Sleeping %.1f sec until just before the next minute\n",
+                t.tm_hour, t.tm_min, t.tm_sec, sleepUs / 1e6);
+  deepSleepMicros((uint64_t)sleepUs);
+}
+
+// Start of the minute that is about to begin (we wake ~2 s before it), as
+// Unix time, or 0 if the time is not known
+time_t upcomingMinute() {
+  time_t now = time(nullptr);
+  if (now < 1700000000) return 0;
+  return (now + DISPLAY_UPDATE_SEC + 3) / 60 * 60;
+}
+
+// Sync the clock over NTP, first logging how far the internal clock had
+// drifted since the previous sync. Keeps the internal clock if NTP fails.
+void syncClock() {
+  struct timeval before;
+  gettimeofday(&before, nullptr);
+  bool hadTime = before.tv_sec > 1700000000;
+  unsigned long start = millis();
+
+  sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
+  configTzTime(clockTimezone, "pool.ntp.org", "time.google.com");
+  while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && millis() - start < NTP_TIMEOUT_MS) {
+    delay(10);
+  }
+  ntpMs = millis() - start;
+  if (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED) {
+    Serial.println("NTP sync failed, keeping the internal clock");
+    return;
+  }
+
+  struct timeval after;
+  gettimeofday(&after, nullptr);
+  if (hadTime) {
+    // Where the internal clock would be now without the sync, versus NTP
+    int64_t expectedUs = (int64_t)before.tv_sec * 1000000LL + before.tv_usec + (int64_t)ntpMs * 1000LL;
+    int64_t actualUs = (int64_t)after.tv_sec * 1000000LL + after.tv_usec;
+    long driftMs = (long)((expectedUs - actualUs) / 1000);
+    long sinceSync = lastClockSync ? (long)(after.tv_sec - lastClockSync) : -1;
+    Serial.printf("[CLOCK] internal clock was %+ld ms off NTP (+ = ahead), %ld s after the previous sync\n",
+                  driftMs, sinceSync);
+  } else {
+    Serial.println("[CLOCK] time set by NTP (no previous time to compare)");
+  }
+  lastClockSync = after.tv_sec;
 }
 
 // After a button wake, wait for the button to be released and pressed again
@@ -295,6 +385,83 @@ int pngDraw(PNGDRAW *pDraw) {
   return 1;
 }
 
+// Draw a PNG on the whole display with a full refresh; false if it can't be decoded
+bool drawImage(uint8_t* data, int len) {
+  if (png.openRAM(data, len, pngDraw) != PNG_SUCCESS) return false;
+  png.close();
+  unsigned long start = millis();
+  // Full refresh every time using the panel's fast OTP waveform (~1.2s, ghost-free)
+  display.setFullWindow();
+  display.firstPage();
+  int rc;
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    rc = png.openRAM(data, len, pngDraw);
+    if (rc == PNG_SUCCESS) { png.decode(NULL, 0); png.close(); }
+  } while (display.nextPage());
+  displayMs = millis() - start;
+  return rc == PNG_SUCCESS;
+}
+
+// Display wake: show the stored image for this minute and delete it.
+// False if it is missing or broken, in which case the wake becomes a fetch.
+bool showStoredImage(time_t minute) {
+  size_t len = 0;
+  uint8_t* data = batchLoad(minute, &len);
+  bool shown = data && drawImage(data, (int)len);
+  free(data);
+  batchRemove(minute);
+  return shown;
+}
+
+// Download one image into a malloc'd buffer (caller frees). afterGet runs on a
+// 200 response, while its headers can still be read. On failure returns nullptr
+// and puts the reason for the offline screen in failure.
+uint8_t* downloadImage(HTTPClient& http, WiFiClient& client, const String& url, int* len,
+                       char* failure, size_t failureSize, std::function<void()> afterGet = nullptr) {
+  unsigned long start = millis();
+  uint8_t* buffer = nullptr;
+  if (!http.begin(client, url)) {
+    Serial.println("HTTP begin failed!");
+    strlcpy(failure, "No internet", failureSize);
+  } else {
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+      if (afterGet) afterGet();
+      *len = http.getSize();
+      buffer = *len > 0 ? (uint8_t*)malloc(*len) : nullptr;
+      if (buffer == nullptr) {
+        Serial.printf("Invalid image length or out of memory: %d\n", *len);
+        strlcpy(failure, "Invalid image from server", failureSize);
+      } else if (http.getStreamPtr()->readBytes(buffer, *len) != (size_t)*len) {
+        Serial.println("Image download incomplete");
+        strlcpy(failure, "No internet", failureSize);
+        free(buffer);
+        buffer = nullptr;
+      } else if (png.openRAM(buffer, *len, pngDraw) != PNG_SUCCESS) {
+        // E.g. a hotel or captive-portal network answering with a web page
+        Serial.println("Downloaded file is not a PNG");
+        strlcpy(failure, "Invalid image from server", failureSize);
+        free(buffer);
+        buffer = nullptr;
+      } else {
+        png.close();
+      }
+    } else if (httpCode < 0) {
+      // No connection to the server at all: DNS, TCP or TLS failed, or timed out
+      Serial.printf("HTTP GET failed: %s\n", HTTPClient::errorToString(httpCode).c_str());
+      strlcpy(failure, "No internet", failureSize);
+    } else {
+      Serial.printf("HTTP GET failed, error code: %d\n", httpCode);
+      snprintf(failure, failureSize, "Server error (HTTP %d)", httpCode);
+    }
+    http.end();  // Keeps the connection open for the next request when the server allows it
+  }
+  if (downloadMs.length() > 0) downloadMs += ",";
+  downloadMs += String(millis() - start);
+  return buffer;
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -311,7 +478,46 @@ void setup() {
 
   delay(500);
 
-  // Read the battery once per wake, before Wi-Fi starts
+  // Local time zone, for the logs and the clock drawn when offline
+  setenv("TZ", clockTimezone, 1);
+  tzset();
+
+  // Initialize SPI bus for display
+  SPI.end();
+  SPI.begin(EPD_SCK, EPD_MISO, EPD_MOSI, EPD_CS);
+
+  // Always initialize with initial=true to use the fast full-refresh OTP waveform.
+  // The GDEY075T7 full refresh is ~1.2s (fast, clean, no ghosting).
+  display.init(115200, true, 20, false);
+  display.setRotation(0);
+
+  // A button press always fetches fresh images, so settings changes show up
+  // right away instead of after the stored minutes run out
+  bool buttonWake = wakeCause == ESP_SLEEP_WAKEUP_EXT0 || wakeCause == ESP_SLEEP_WAKEUP_EXT1;
+  if (buttonWake && batchExists()) {
+    Serial.println("Button pressed: discarding stored images");
+    batchDiscard();
+  }
+
+  // Display wake: in battery save mode, show the stored image for this minute
+  // without Wi-Fi. Anything unexpected turns it into a fetch wake.
+  if (wakeCause == ESP_SLEEP_WAKEUP_TIMER) {
+    time_t minute = upcomingMinute();
+    if (minute != 0 && batchCovers(minute)) {
+      wakeType = "display";
+      if (showStoredImage(minute)) {
+        Serial.println("Display wake: showed stored image");
+        display.powerOff();
+        sleepUntilNextMinute();
+      }
+      Serial.println("Stored image missing or unreadable, fetching instead");
+      wakeType = "fetch(missing)";
+    }
+  }
+
+  // Fetch wake from here on: Wi-Fi, fresh images, battery and update check
+
+  // Read the battery, before Wi-Fi starts
   int batteryMv = readBatteryMv();
   updateChargingState(batteryMv);
   if (batteryMv > 0) {
@@ -325,19 +531,8 @@ void setup() {
     Serial.println("Setup button pressed twice. Forcing config portal...");
   }
   if (wakeCause == ESP_SLEEP_WAKEUP_EXT1) {
-    // Nothing special to do: every wake fetches a fresh image and then sleeps
-    // until the next minute boundary, which is exactly what a refresh needs.
     Serial.println("Refresh button pressed. Refreshing now...");
   }
-
-  // Initialize SPI bus for display
-  SPI.end();
-  SPI.begin(EPD_SCK, EPD_MISO, EPD_MOSI, EPD_CS);
-
-  // Always initialize with initial=true to use the fast full-refresh OTP waveform.
-  // The GDEY075T7 full refresh is ~1.2s (fast, clean, no ghosting).
-  display.init(115200, true, 20, false);
-  display.setRotation(0);
 
   // Load saved preferences from flash
   String username = loadPreference("username", "");
@@ -403,6 +598,7 @@ void setup() {
     return WiFi.status() == WL_CONNECTED || connectToSavedNetwork(WIFI_CONNECT_TIMEOUT_MS);
   };
 
+  unsigned long wifiStart = millis();
   bool connected = false;
   if (forceConfigPortal) {
     connected = runSetupPortal(false);
@@ -421,6 +617,7 @@ void setup() {
   }
 
   if (connected) {
+    wifiMs = millis() - wifiStart;
     rememberConnectedNetwork();
   }
 
@@ -447,89 +644,53 @@ void setup() {
   Serial.println("WiFi Connected! IP: " + WiFi.localIP().toString());
   Serial.printf("Configured User: '%s' | Server: '%s'\n", username.c_str(), server.c_str());
 
-  // Sync time via NTP so we can sleep until the next exact minute boundary
-  configTzTime(clockTimezone, "pool.ntp.org", "time.google.com");
+  // Sync the clock; the requests below name the exact minutes they want
+  syncClock();
+  time_t firstMinute = upcomingMinute();  // 0 if the time is still unknown
 
-  // Construct URL to fetch image
-  String imageUrl = buildImageUrl(server, username, batteryMv, chargingState);
-  Serial.println("Fetching image from: " + imageUrl);
-
+  String baseUrl = normalizeServerUrl(server);
   HTTPClient http;
   http.setTimeout(15000);
-  bool httpBeginSuccess = false;
-
+  http.setReuse(true);
   WiFiClient standardClient;
   WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+  WiFiClient& client = baseUrl.startsWith("https://") ? (WiFiClient&)secureClient : standardClient;
 
-  if (imageUrl.startsWith("https://")) {
-    secureClient.setInsecure();
-    httpBeginSuccess = http.begin(secureClient, imageUrl);
-  } else {
-    httpBeginSuccess = http.begin(standardClient, imageUrl);
-  }
-
-  bool imageShown = false;
   FirmwareOffer firmwareOffer;
+  int batchMinutes = 1;
   char failure[48] = "";
 
-  if (httpBeginSuccess) {
-    static const char* const clockHeaders[] = {"X-Clock-Timezone"};
-    collectFirmwareHeaders(http, clockHeaders, 1);
-    int httpCode = http.GET();
-    if (httpCode == HTTP_CODE_OK) {
-      firmwareOffer = readFirmwareOffer(http);
+  String imageUrl = buildImageUrl(server, username, batteryMv, chargingState, firstMinute);
+  Serial.println("Fetching image from: " + imageUrl);
+  static const char* const clockHeaders[] = {"X-Clock-Timezone", "X-Batch-Minutes"};
+  collectFirmwareHeaders(http, clockHeaders, 2);
+  int len = 0;
+  uint8_t* buffer = downloadImage(http, client, imageUrl, &len, failure, sizeof(failure), [&]() {
+    firmwareOffer = readFirmwareOffer(http);
 
-      String tz = http.header("X-Clock-Timezone");
-      tz.trim();
-      if (tz.length() > 0 && tz.length() < sizeof(clockTimezone) && tz != clockTimezone) {
-        strlcpy(clockTimezone, tz.c_str(), sizeof(clockTimezone));
-        setenv("TZ", clockTimezone, 1);
-        tzset();
-        Serial.printf("Clock time zone set to %s\n", clockTimezone);
-      }
-
-      int len = http.getSize();
-      uint8_t* buffer = len > 0 ? (uint8_t*)malloc(len) : nullptr;
-      if (buffer == nullptr) {
-        Serial.printf("Invalid image length or out of memory: %d\n", len);
-        strlcpy(failure, "Invalid image from server", sizeof(failure));
-      } else if (http.getStreamPtr()->readBytes(buffer, len) != (size_t)len) {
-        Serial.println("Image download incomplete");
-        strlcpy(failure, "No internet", sizeof(failure));
-      } else if (png.openRAM(buffer, len, pngDraw) != PNG_SUCCESS) {
-        // E.g. a hotel or captive-portal network answering with a web page
-        Serial.println("Downloaded file is not a PNG");
-        strlcpy(failure, "Invalid image from server", sizeof(failure));
-      } else {
-        png.close();
-        // Full refresh every time using the panel's fast OTP waveform (~1.2s, ghost-free)
-        Serial.println("Display: Full refresh (fast OTP waveform)...");
-        display.setFullWindow();
-        display.firstPage();
-        int rc;
-        do {
-          display.fillScreen(GxEPD_WHITE);
-          rc = png.openRAM(buffer, len, pngDraw);
-          if (rc == PNG_SUCCESS) { png.decode(NULL, 0); png.close(); }
-        } while (display.nextPage());
-        imageShown = (rc == PNG_SUCCESS);
-        Serial.println("Display update complete!");
-      }
-      free(buffer);
-    } else if (httpCode < 0) {
-      // No connection to the server at all: DNS, TCP or TLS failed, or timed out
-      Serial.printf("HTTP GET failed: %s\n", HTTPClient::errorToString(httpCode).c_str());
-      strlcpy(failure, "No internet", sizeof(failure));
-    } else {
-      Serial.printf("HTTP GET failed, error code: %d\n", httpCode);
-      snprintf(failure, sizeof(failure), "Server error (HTTP %d)", httpCode);
+    String tz = http.header("X-Clock-Timezone");
+    tz.trim();
+    if (tz.length() > 0 && tz.length() < sizeof(clockTimezone) && tz != clockTimezone) {
+      strlcpy(clockTimezone, tz.c_str(), sizeof(clockTimezone));
+      setenv("TZ", clockTimezone, 1);
+      tzset();
+      Serial.printf("Clock time zone set to %s\n", clockTimezone);
     }
-    http.end();
-  } else {
-    Serial.println("HTTP begin failed!");
-    strlcpy(failure, "No internet", sizeof(failure));
-  }
 
+    String batch = http.header("X-Batch-Minutes");
+    if (batch.length() > 0) {
+      batchMinutes = constrain((int)batch.toInt(), 1, MAX_BATCH_MINUTES);
+    }
+  });
+
+  bool imageShown = false;
+  if (buffer) {
+    Serial.println("Display: Full refresh (fast OTP waveform)...");
+    imageShown = drawImage(buffer, len);
+    free(buffer);
+    Serial.println("Display update complete!");
+  }
   if (!imageShown) {
     showOfflineScreen(failure[0] ? failure : "No internet");
   }
@@ -542,34 +703,41 @@ void setup() {
     confirmRunningFirmware();
   }
 
+  // Battery save mode: fetch the following minutes in this same Wi-Fi session
+  // and store them, so the next wakes can show them without Wi-Fi. Needs the
+  // time, since every request names its minute. Failed minutes are skipped;
+  // their wake becomes a fetch wake.
+  if (imageShown && batchMinutes > 1 && firstMinute != 0) {
+    Serial.printf("Battery save mode: fetching the next %d minutes\n", batchMinutes - 1);
+    if (batchStart()) {
+      int stored = 0;
+      for (int i = 1; i < batchMinutes; i++) {
+        time_t minute = firstMinute + 60 * i;
+        String url = buildImageUrl(server, username, batteryMv, chargingState, minute);
+        char ignored[48];
+        int minuteLen = 0;
+        uint8_t* data = downloadImage(http, client, url, &minuteLen, ignored, sizeof(ignored));
+        if (data && batchSave(minute, data, minuteLen)) stored++;
+        free(data);
+      }
+      Serial.printf("Battery save mode: stored %d of %d minutes\n", stored, batchMinutes - 1);
+    }
+  } else if (batchExists()) {
+    batchDiscard();  // Leftovers from before battery save mode was turned off
+  }
+
   // Install an offered update only now, so a slow download never delays the minute.
   // Returns only if nothing was installed; on success the device restarts.
   if (imageShown && firmwareOffer.present) {
     if (chargingState == 1 || batteryMv >= OTA_MIN_BATTERY_MV) {
-      installFirmwareUpdate(firmwareOffer, normalizeServerUrl(server));
+      installFirmwareUpdate(firmwareOffer, baseUrl);
     } else {
       Serial.printf("OTA: %s offered, waiting for USB power or %d mV battery\n",
                     firmwareOffer.version.c_str(), OTA_MIN_BATTERY_MV);
     }
   }
 
-  // Calculate sleep duration to wake up right at the next minute boundary.
-  // We subtract DISPLAY_UPDATE_SEC so the display finishes updating before the minute ticks.
-  uint32_t sleepSec = SLEEP_FALLBACK_SEC;
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo, 3000)) {
-    int secsIntoMinute = timeinfo.tm_sec;
-    // Sleep until next minute, minus display update time so we're ready right on the minute
-    int secsUntilNextMinute = 60 - secsIntoMinute - DISPLAY_UPDATE_SEC;
-    if (secsUntilNextMinute <= 0) secsUntilNextMinute += 60; // already past the window
-    sleepSec = (uint32_t)secsUntilNextMinute;
-    Serial.printf("NTP time: %02d:%02d:%02d | Sleeping %u sec to sync with next minute boundary\n",
-                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, sleepSec);
-  } else {
-    Serial.printf("NTP sync failed. Falling back to %u sec sleep.\n", sleepSec);
-  }
-
-  enterDeepSleep(sleepSec);
+  sleepUntilNextMinute();
 }
 
 void loop() {

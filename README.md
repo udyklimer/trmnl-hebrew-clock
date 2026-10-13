@@ -57,7 +57,7 @@ A single press only wakes the device, which then refreshes the clock as usual. T
 
 ### Refreshing on demand
 
-Press the `KEY2` button once. The device wakes, downloads the current image and shows it straight away, without waiting for the minute to end. Use it after changing your settings on the server. The device then goes back to its normal rhythm and refreshes again when the minute changes.
+Press the `KEY2` button once. The device wakes, downloads the current image and shows it straight away, without waiting for the minute to end. Use it after changing your settings on the server. The device then goes back to its normal rhythm and refreshes again when the minute changes. In battery save mode a press also discards the stored images and downloads a fresh set (a single `KEY1` press does the same).
 
 The portal also opens by itself if Wi-Fi is connected but no user name has been set.
 
@@ -81,26 +81,58 @@ The device's own time comes from the last successful time sync. It is lost on a 
 
 ## How it works
 
-On each wake the firmware:
+The device wakes about 2 seconds before every minute, shows that minute's image, and goes back to deep sleep. There are two kinds of wake.
+
+### Fetch wake (Wi-Fi on)
 
 1. Loads the user name and server URL from flash (NVS).
 2. Reads the battery voltage.
 3. Connects to one of the remembered Wi-Fi networks, or opens the setup portal (see [Wi-Fi](#wi-fi)).
-4. Downloads the clock image, reporting the battery status in the request (see below).
-5. Decodes the PNG, converts each pixel to black or white and draws it with a full display refresh. If the image can't be downloaded, it draws the time itself instead (see [When there is no internet](#when-there-is-no-internet)).
-6. Confirms the running firmware, and installs a firmware update if the server offered one (see [Firmware updates](#firmware-updates)).
-7. Syncs the time over NTP and sleeps until about 2 seconds before the next minute, so the next image is on screen as the minute changes. If NTP is unavailable it sleeps for 60 seconds.
+4. Syncs the time over NTP.
+5. Downloads the image for the minute that is about to start, reporting the battery status in the request (see below).
+6. Decodes the PNG, converts each pixel to black or white and draws it with a full display refresh. If the image can't be downloaded, it draws the time itself instead (see [When there is no internet](#when-there-is-no-internet)).
+7. In battery save mode, downloads the images for the following minutes and stores them in flash.
+8. Confirms the running firmware, and installs a firmware update if the server offered one (see [Firmware updates](#firmware-updates)).
+9. Sleeps until about 2 seconds before the next minute. If the time is unknown it sleeps for 60 seconds.
+
+### Display wake (no Wi-Fi)
+
+Only in battery save mode: the device reads the stored image for the current minute from flash, shows it, deletes it and goes back to sleep. Wi-Fi stays off, which is what saves the battery.
+
+## Battery save mode
+
+Battery save mode is set on the server's settings page, as the number of minutes N (1 to 15) the device fetches at a time. The server reports it with every image (`X-Batch-Minutes`).
+
+- **N = 1** is the normal mode: every wake is a fetch wake and nothing is stored in flash.
+- **N > 1**: a fetch wake downloads the current minute and the next N-1 minutes in one Wi-Fi session, shows the first and stores the rest. The next N-1 wakes are display wakes. Images from the previous batch are deleted first.
+
+A wake is a fetch wake when any of these is true:
+
+- it is the first start, or the device was reset
+- the stored minutes have run out, which happens every N minutes
+- `KEY1` or `KEY2` was pressed (the stored images are discarded)
+- the image for the current minute is missing, for example because its download failed
+- the device does not know the time
+
+Settings changed on the server therefore show up at the next fetch wake, at most N minutes later, or straight away after pressing `KEY2`. A change of N itself also takes effect at the next fetch.
+
+Battery reading, charging detection and the firmware update check only happen on fetch wakes.
+
+Between fetch wakes the time comes only from the chip's internal timer, which drifts. On every fetch wake the device logs how far it was off before correcting it with NTP (the `[CLOCK]` line on the serial monitor). Each wake also logs how long Wi-Fi, each download and the display refresh took, and the total awake time (the `[TIMING]` line).
+
+Stored images go to the 1.5 MB `spiffs` data partition, formatted as LittleFS the first time battery save mode is used.
 
 ## Image request and battery status
 
 The image is requested from:
 
 ```
-<server>/clock.png?user=<user name>&fw=<version>&battery_mv=<millivolts>&charging=<0|1>
+<server>/clock.png?user=<user name>&fw=<version>&battery_mv=<millivolts>&charging=<0|1>&at=<Unix time>
 ```
 
 - `user`: the user name set in the setup portal.
 - `fw`: the firmware version, for example `1.5.0`, or `0.0.0-dev` for a local build.
+- `at`: the minute to render, as a Unix time in seconds within that minute. Left out when the device does not know the time.
 - `battery_mv`: the battery voltage in millivolts, for example `4063`. It is measured once per wake, before Wi-Fi starts. The device sends the voltage only; the server turns it into a percentage.
 - `charging`: `1` when the device believes USB power is connected, `0` when it believes it is not.
 
