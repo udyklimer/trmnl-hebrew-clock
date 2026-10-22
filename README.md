@@ -39,13 +39,15 @@ The first firmware with over-the-air update support has to be flashed by cable. 
 
 ## First-time setup
 
-1. Power the device. With no saved Wi-Fi network it shows a "WiFi Setup Mode" screen and opens an access point named `HebrewClock-Setup-XXXX`, where `XXXX` is the end of the device's MAC address, so several clocks in one place can be told apart. The exact name is shown on the screen.
-2. Connect to that access point from a phone or computer and open the configuration page.
-3. Choose your Wi-Fi network and enter its password.
-4. Fill in the two extra fields:
-   - **User Name**: your user name on the clock server.
-   - **Server URL**: the clock server address. Defaults to `https://clock.udyklimer.com`. If you leave out the scheme, `https://` is assumed.
-5. Save. The device connects and shows the clock.
+With no saved Wi-Fi network, the screen shows "Set up your clock" with two steps, each with a QR code to scan with a phone:
+
+1. **Create an account.** The left QR code opens the clock server (`https://clock.udyklimer.com` by default), where you sign up and get your user name. Skip this if you already have one. Do it first: while the phone is connected to the clock in step 2 it has no internet.
+2. **Connect the clock.** The right QR code joins the clock's own hotspot, `HebrewClock-Setup-XXXX`, where `XXXX` is the end of the device's MAC address, so several clocks in one place can be told apart. The name is also printed on the screen, for joining by hand. The configuration page opens by itself; there:
+   - choose your Wi-Fi network and enter its password
+   - enter your **User Name** from step 1
+   - leave **Server URL** as it is, unless you use another clock server (if you leave out the scheme, `https://` is assumed)
+
+Save, and the device connects and shows the clock.
 
 The portal closes after 3 minutes without input. The device then sleeps for a minute and tries again. Saving only the user name or server URL closes the portal straight away.
 

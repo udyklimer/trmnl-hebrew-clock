@@ -16,6 +16,8 @@
 #include <Fonts/FreeSansBold24pt7b.h>
 #include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSans12pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
+#include <qrcode.h>
 
 // KEY1 on the TRMNL OG DIY Kit (D1, active low). KEY2 is D2 and KEY3 is D4.
 // One press wakes the device from deep sleep (handy before a firmware upload);
@@ -304,27 +306,81 @@ String setupHotspotName() {
   return String(name);
 }
 
-void showSetupScreen(const String& hotspotName) {
+// Where esp_qrcode_generate() should draw; its callback takes no context
+static int16_t qrCenterX, qrTop, qrWidth;
+
+static void drawQrModules(esp_qrcode_handle_t qrcode) {
+  int size = esp_qrcode_get_size(qrcode);
+  int16_t qrScale = qrWidth / size;
+  int16_t qrLeft = qrCenterX - size * qrScale / 2;
+  for (int y = 0; y < size; y++) {
+    for (int x = 0; x < size; x++) {
+      if (esp_qrcode_get_module(qrcode, x, y)) {
+        display.fillRect(qrLeft + x * qrScale, qrTop + y * qrScale, qrScale, qrScale, GxEPD_BLACK);
+      }
+    }
+  }
+}
+
+// Draw a QR code of about `width` pixels, horizontally centered on centerX
+void drawQrCode(const String& text, int16_t centerX, int16_t top, int16_t width) {
+  esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
+  cfg.display_func = drawQrModules;
+  cfg.qrcode_ecc_level = ESP_QRCODE_ECC_LOW;
+  qrCenterX = centerX;
+  qrTop = top;
+  qrWidth = width;
+  esp_qrcode_generate(&cfg, text.c_str());
+}
+
+void printCenteredAt(const char* text, int16_t centerX, int16_t y) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(text, 0, y, &x1, &y1, &w, &h);
+  display.setCursor(centerX - w / 2 - x1, y);
+  display.print(text);
+}
+
+// First-time setup in two steps, each with a QR code to scan with a phone:
+// 1. register on the clock server (needs the phone's normal internet, so it
+//    comes first), 2. join the clock's hotspot and enter Wi-Fi and user name.
+void showSetupScreen(const String& hotspotName, const String& serverUrl) {
+  String serverHost = serverUrl.substring(serverUrl.indexOf("://") + 3);
+  String wifiQr = "WIFI:T:nopass;S:" + hotspotName + ";;";
+  const int16_t left = display.width() / 4;
+  const int16_t right = display.width() * 3 / 4;
+
   display.setFullWindow();
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
-    display.drawRect(20, 20, display.width() - 40, display.height() - 40, GxEPD_BLACK);
+    display.setTextColor(GxEPD_BLACK);
+    display.setTextSize(1);
+
+    display.setFont(&FreeSansBold18pt7b);
+    printCenteredAt("Set up your clock", display.width() / 2, 50);
+    display.drawLine(display.width() / 2, 80, display.width() / 2, display.height() - 20, GxEPD_BLACK);
+
+    // Step 1: account on the server
+    display.setFont(&FreeSansBold12pt7b);
+    printCenteredAt("1. Create an account", left, 105);
+    drawQrCode(serverUrl, left, 125, 180);
+    display.setFont(&FreeSans12pt7b);
+    printCenteredAt("Scan to sign up at", left, 345);
+    printCenteredAt(serverHost.c_str(), left, 375);
+    printCenteredAt("Have a user name? Skip this.", left, 425);
+
+    // Step 2: the clock's own hotspot
+    display.setFont(&FreeSansBold12pt7b);
+    printCenteredAt("2. Connect the clock", right, 105);
+    drawQrCode(wifiQr, right, 125, 180);
+    display.setFont(&FreeSans12pt7b);
+    printCenteredAt("Scan to join", right, 345);
+    printCenteredAt(hotspotName.c_str(), right, 375);
+    printCenteredAt("Then choose your Wi-Fi", right, 410);
+    printCenteredAt("and enter your user name", right, 440);
 
     display.setFont(NULL);
-    display.setTextColor(GxEPD_BLACK);
-    display.setTextSize(3);
-    display.setCursor(60, 100);
-    display.print("WiFi Setup Mode");
-
-    display.setTextSize(2);
-    display.setCursor(60, 180);
-    display.print("1. Connect to Wi-Fi:");
-    display.setCursor(80, 220);
-    display.print("   '" + hotspotName + "'");
-
-    display.setCursor(60, 280);
-    display.print("2. Configure WiFi & Username");
   } while (display.nextPage());
 }
 
@@ -573,7 +629,7 @@ void setup() {
   // up again without anyone touching the portal.
   auto runSetupPortal = [&](bool retrySaved) -> bool {
     configSaved = false;  // Only a save in this portal session closes it
-    showSetupScreen(hotspotName);
+    showSetupScreen(hotspotName, normalizeServerUrl(server));
     wm.setConfigPortalBlocking(false);
     wm.startConfigPortal(hotspotName.c_str());
     unsigned long lastRetry = millis();
