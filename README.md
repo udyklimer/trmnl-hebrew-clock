@@ -45,15 +45,14 @@ With no saved Wi-Fi network, the screen shows "Set up your clock" with two steps
 2. **Connect the clock.** The right QR code joins the clock's own hotspot, `HebrewClock-Setup-XXXX`, where `XXXX` is the end of the device's MAC address, so several clocks in one place can be told apart. The name is also printed on the screen, for joining by hand. The configuration page opens by itself; there:
    - choose your Wi-Fi network and enter its password
    - enter your **User Name** from step 1
-   - leave **Server URL** as it is, unless you use another clock server (if you leave out the scheme, `https://` is assumed)
 
 Save, and the device connects and shows the clock.
 
-The portal closes after 3 minutes without input. The device then sleeps for a minute and tries again. Saving only the user name or server URL closes the portal straight away.
+The portal closes after 3 minutes without input. The device then sleeps for a minute and tries again. Saving only the user name closes the portal straight away.
 
 ### Changing the settings later
 
-Press the `KEY1` button twice, with the second press within 3 seconds of the first. The first press wakes the device; the second makes it show the "WiFi Setup Mode" screen and open the setup portal again, with the current values filled in.
+Press the `KEY1` button twice, with the second press within 3 seconds of the first. The first press wakes the device; the second makes it show the "Set up your clock" screen and open the setup portal again, with the current user name filled in.
 
 A single press only wakes the device, which then refreshes the clock as usual. This is useful for waking it before uploading new firmware.
 
@@ -71,7 +70,7 @@ The device remembers the last 5 Wi-Fi networks it connected to. Taking it to ano
 
 ### When Wi-Fi is lost
 
-If no remembered network can be reached, the device shows the "WiFi Setup Mode" screen and opens the setup portal, as on first setup. While the portal is open it keeps checking every 30 seconds whether a remembered network is back in range, for example after a router restart, and if so closes the portal and shows the clock again.
+If no remembered network can be reached, the device shows the "Set up your clock" screen and opens the setup portal, as on first setup. While the portal is open it keeps checking every 30 seconds whether a remembered network is back in range, for example after a router restart, and if so closes the portal and shows the clock again.
 
 The portal closes after 3 minutes without use. The device then sleeps for a minute and starts over, so it keeps trying for as long as the outage lasts. Note that this cycle keeps the radio on most of the time, which drains the battery much faster than normal operation.
 

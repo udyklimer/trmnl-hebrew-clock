@@ -598,17 +598,15 @@ void setup() {
   wm.setConnectTimeout(WIFI_CONNECT_TIMEOUT_MS / 1000);
   wm.setConfigPortalTimeout(SETUP_PORTAL_TIMEOUT_SEC);
 
-  // Setup custom WiFiManager parameters
+  // Setup custom WiFiManager parameters. The server URL is deliberately not
+  // offered: a wrong value cuts the device off from its images and updates.
+  // It stays in NVS (default DEFAULT_SERVER) for a later firmware to change.
   char custom_username_buf[64] = {0};
-  char custom_server_buf[128] = {0};
   username.toCharArray(custom_username_buf, sizeof(custom_username_buf));
-  server.toCharArray(custom_server_buf, sizeof(custom_server_buf));
 
   WiFiManagerParameter custom_username("username", "User Name", custom_username_buf, sizeof(custom_username_buf));
-  WiFiManagerParameter custom_server("server", "Server URL (e.g. https://clock.udyklimer.com)", custom_server_buf, sizeof(custom_server_buf));
 
   wm.addParameter(&custom_username);
-  wm.addParameter(&custom_server);
 
   bool configSaved = false;
   wm.setSaveConfigCallback([&configSaved]() {
@@ -680,15 +678,9 @@ void setup() {
   // Retrieve values from custom fields
   String entered_user = String(custom_username.getValue());
   entered_user.trim();
-  String entered_server = String(custom_server.getValue());
-  entered_server.trim();
-  if (entered_server.length() == 0) {
-    entered_server = DEFAULT_SERVER;
-  }
 
-  if (configSaved || entered_user != username || entered_server != server) {
+  if (configSaved || entered_user != username) {
     username = entered_user;
-    server = entered_server;
     savePreferences(username, server);
   }
 
