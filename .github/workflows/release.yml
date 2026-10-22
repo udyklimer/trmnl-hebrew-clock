@@ -35,8 +35,12 @@ jobs:
           path: ~/.platformio
           key: platformio-${{ hashFiles('platformio.ini') }}
 
-      - name: Install PlatformIO
-        run: pip install platformio
+      - name: Install PlatformIO and libraries
+        # Install the libraries before building: a library that is installed
+        # during the build itself can be missed by that build
+        run: |
+          pip install platformio
+          pio pkg install
 
       - name: Build
         env:

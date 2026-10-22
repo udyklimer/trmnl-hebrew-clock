@@ -121,7 +121,21 @@ Battery reading, charging detection and the firmware update check only happen on
 
 Between fetch wakes the time comes only from the chip's internal timer, which drifts. On every fetch wake the device logs how far it was off before correcting it with NTP (the `[CLOCK]` line on the serial monitor). Each wake also logs how long Wi-Fi, each download and the display refresh took, and the total awake time (the `[TIMING]` line).
 
-Stored images go to the 1.5 MB `spiffs` data partition, formatted as LittleFS the first time battery save mode is used.
+Stored images are drawn in the same mode (black and white or gray) as the fetch that stored them. Stored images go to the 1.5 MB `spiffs` data partition, formatted as LittleFS the first time battery save mode is used.
+
+## Gray levels
+
+The panel can show black and white or 4 shades of gray. The choice is made on the server's settings page; the server reports it with every image (`X-Gray-Levels: 2` or `4`), and the device has no setting of its own.
+
+| | Black and white (2) | Gray (4) |
+|---|---|---|
+| Image | 1-bit PNG | 2-bit PNG with levels 0, 85, 170 and 255 |
+| Waveform | the panel's fast built-in one | a slower one loaded by the driver |
+| Refresh time | about 1.2 s | about 2.3 s (the driver allows up to 2.5 s) |
+
+Gray uses the [GxEPD2_4G](https://github.com/ZinggJM/GxEPD2_4G) library, a variant of GxEPD2 that drives the same panel in both modes. Each pixel is drawn as the nearest of the 4 levels. The gray shades can differ a little between panels and with temperature, and gray mode leaves slightly more ghosting.
+
+The `[TIMING]` line on the serial monitor shows the mode of each wake (`mode=bw` or `mode=gray4`) and how long the display refresh took (`display=`), to compare the two on the real panel.
 
 ## Image request and battery status
 
@@ -205,7 +219,7 @@ openssl pkey -in firmware_signing_private.pem -pubout -out firmware_signing_publ
 
 ## Libraries
 
-- [GxEPD2](https://github.com/ZinggJM/GxEPD2): e-paper display driver
+- [GxEPD2_4G](https://github.com/ZinggJM/GxEPD2_4G): e-paper display driver, black and white and 4 gray levels
 - [PNGdec](https://github.com/bitbank2/PNGdec): PNG decoder
 - [WiFiManager](https://github.com/tzapu/WiFiManager): Wi-Fi and settings portal
 

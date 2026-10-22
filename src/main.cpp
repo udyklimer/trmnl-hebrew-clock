@@ -3,7 +3,8 @@
 #include <WiFiManager.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
-#include <GxEPD2_BW.h>
+#include <GxEPD2_4G_BW.h>
+#include <GxEPD2_4G_4G.h>
 #include <PNGdec.h>
 #include <Preferences.h>
 #include <time.h>
@@ -39,9 +40,18 @@
 #define EPD_MISO -1  
 #define EPD_MOSI 9   // GPIO 9
 
-GxEPD2_BW<GxEPD2_750_GDEY075T7, GxEPD2_750_GDEY075T7::HEIGHT> display(
-  GxEPD2_750_GDEY075T7(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
-);
+// One panel driver, used in two modes. `display` is black and white with the
+// panel's fast built-in waveform (~1.2 s), used for everything by default.
+// `displayGray` draws 4 gray levels with a slower loaded waveform (~2.3 s); its
+// 2-bit buffer is split into 4 pages of 120 rows to save RAM.
+GxEPD2_750_GDEY075T7 epd(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY);
+GxEPD2_4G_BW_R<GxEPD2_750_GDEY075T7, GxEPD2_750_GDEY075T7::HEIGHT> display(epd);
+GxEPD2_4G_4G_R<GxEPD2_750_GDEY075T7, GxEPD2_750_GDEY075T7::HEIGHT / 4> displayGray(epd);
+
+// Gray levels of the image being drawn: 2 (black and white) or 4. Set from
+// the server's X-Gray-Levels header, and kept for the stored batch images.
+static int drawGrayLevels = 2;
+RTC_DATA_ATTR uint8_t batchGrayLevels = 2;
 
 PNG png;
 
@@ -63,6 +73,7 @@ static const char* wakeType = "fetch";
 static long wifiMs = -1;
 static long ntpMs = -1;
 static long displayMs = -1;
+static const char* displayMode = "-";  // "bw" or "gray4" when an image was drawn
 static String downloadMs;  // Comma-separated, one entry per image download
 
 // Time zone for the clock the device draws itself when the server can't be
@@ -198,8 +209,8 @@ String buildImageUrl(const String& srv, const String& user, int batteryMv, int c
 
 // Deep sleep for the given time, waking early if either button is pressed
 void deepSleepMicros(uint64_t micros) {
-  Serial.printf("[TIMING] wake=%s wifi=%ldms ntp=%ldms downloads=[%s]ms display=%ldms total=%lums\n",
-                wakeType, wifiMs, ntpMs, downloadMs.c_str(), displayMs, millis());
+  Serial.printf("[TIMING] wake=%s wifi=%ldms ntp=%ldms downloads=[%s]ms mode=%s display=%ldms total=%lums\n",
+                wakeType, wifiMs, ntpMs, downloadMs.c_str(), displayMode, displayMs, millis());
   Serial.flush();
   // Keep the buttons pulled up while sleeping so only a press pulls them low
   rtc_gpio_pullup_en((gpio_num_t)SETUP_BUTTON);
@@ -433,28 +444,48 @@ int pngDraw(PNGDRAW *pDraw) {
     uint8_t r = (color >> 11) & 0x1F;
     uint8_t g = (color >> 5) & 0x3F;
     uint8_t b = color & 0x1F;
-    uint32_t brightness = (r * 8) + (g * 4) + (b * 8);
-    
-    uint16_t epdColor = (brightness < 256) ? GxEPD_BLACK : GxEPD_WHITE;
-    display.drawPixel(x, pDraw->y, epdColor);
+    if (drawGrayLevels == 4) {
+      // Nearest of the 4 levels 0, 85, 170, 255 (black, dark, light, white)
+      uint8_t gray = ((r << 3) * 77 + (g << 2) * 150 + (b << 3) * 29) >> 8;
+      uint8_t level = (gray + 42) / 85;
+      displayGray.drawGreyPixel(x, pDraw->y, level * 85);
+    } else {
+      uint32_t brightness = (r * 8) + (g * 4) + (b * 8);
+      uint16_t epdColor = (brightness < 256) ? GxEPD_BLACK : GxEPD_WHITE;
+      display.drawPixel(x, pDraw->y, epdColor);
+    }
   }
   return 1;
 }
 
 // Draw a PNG on the whole display with a full refresh; false if it can't be decoded
-bool drawImage(uint8_t* data, int len) {
+bool drawImage(uint8_t* data, int len, int grayLevels) {
   if (png.openRAM(data, len, pngDraw) != PNG_SUCCESS) return false;
   png.close();
+  drawGrayLevels = grayLevels;
   unsigned long start = millis();
-  // Full refresh every time using the panel's fast OTP waveform (~1.2s, ghost-free)
-  display.setFullWindow();
-  display.firstPage();
   int rc;
-  do {
-    display.fillScreen(GxEPD_WHITE);
-    rc = png.openRAM(data, len, pngDraw);
-    if (rc == PNG_SUCCESS) { png.decode(NULL, 0); png.close(); }
-  } while (display.nextPage());
+  if (grayLevels == 4) {
+    // Slower gray waveform; the PNG is decoded once per page
+    displayMode = "gray4";
+    displayGray.setFullWindow();
+    displayGray.firstPage();
+    do {
+      displayGray.fillScreen(GxEPD_WHITE);
+      rc = png.openRAM(data, len, pngDraw);
+      if (rc == PNG_SUCCESS) { png.decode(NULL, 0); png.close(); }
+    } while (displayGray.nextPage());
+  } else {
+    // Full refresh every time using the panel's fast OTP waveform (~1.2s, ghost-free)
+    displayMode = "bw";
+    display.setFullWindow();
+    display.firstPage();
+    do {
+      display.fillScreen(GxEPD_WHITE);
+      rc = png.openRAM(data, len, pngDraw);
+      if (rc == PNG_SUCCESS) { png.decode(NULL, 0); png.close(); }
+    } while (display.nextPage());
+  }
   displayMs = millis() - start;
   return rc == PNG_SUCCESS;
 }
@@ -464,7 +495,7 @@ bool drawImage(uint8_t* data, int len) {
 bool showStoredImage(time_t minute) {
   size_t len = 0;
   uint8_t* data = batchLoad(minute, &len);
-  bool shown = data && drawImage(data, (int)len);
+  bool shown = data && drawImage(data, (int)len, batchGrayLevels);
   free(data);
   batchRemove(minute);
   return shown;
@@ -707,12 +738,13 @@ void setup() {
 
   FirmwareOffer firmwareOffer;
   int batchMinutes = 1;
+  int grayLevels = 2;
   char failure[48] = "";
 
   String imageUrl = buildImageUrl(server, username, batteryMv, chargingState, firstMinute);
   Serial.println("Fetching image from: " + imageUrl);
-  static const char* const clockHeaders[] = {"X-Clock-Timezone", "X-Batch-Minutes"};
-  collectFirmwareHeaders(http, clockHeaders, 2);
+  static const char* const clockHeaders[] = {"X-Clock-Timezone", "X-Batch-Minutes", "X-Gray-Levels"};
+  collectFirmwareHeaders(http, clockHeaders, 3);
   int len = 0;
   uint8_t* buffer = downloadImage(http, client, imageUrl, &len, failure, sizeof(failure), [&]() {
     firmwareOffer = readFirmwareOffer(http);
@@ -730,12 +762,14 @@ void setup() {
     if (batch.length() > 0) {
       batchMinutes = constrain((int)batch.toInt(), 1, MAX_BATCH_MINUTES);
     }
+
+    grayLevels = http.header("X-Gray-Levels").toInt() == 4 ? 4 : 2;
   });
 
   bool imageShown = false;
   if (buffer) {
     Serial.println("Display: Full refresh (fast OTP waveform)...");
-    imageShown = drawImage(buffer, len);
+    imageShown = drawImage(buffer, len, grayLevels);
     free(buffer);
     Serial.println("Display update complete!");
   }
@@ -758,6 +792,7 @@ void setup() {
   if (imageShown && batchMinutes > 1 && firstMinute != 0) {
     Serial.printf("Battery save mode: fetching the next %d minutes\n", batchMinutes - 1);
     if (batchStart()) {
+      batchGrayLevels = grayLevels;  // Display wakes draw the stored images the same way
       int stored = 0;
       for (int i = 1; i < batchMinutes; i++) {
         time_t minute = firstMinute + 60 * i;
