@@ -1,6 +1,7 @@
 # Build, sign and publish a firmware release when a tag vX.Y.Z is pushed.
-# The release gets exactly two assets, firmware.bin and firmware.bin.sig,
-# which the clock server offers to devices as an over-the-air update.
+# The release gets firmware.bin and firmware.bin.sig, which the clock server
+# offers to devices as an over-the-air update, and firmware-full.bin, the
+# complete image for the web installer in install/ (not used for OTA).
 name: Release firmware
 
 on:
@@ -48,6 +49,9 @@ jobs:
         run: |
           pio run
           cp .pio/build/seeed_xiao_esp32s3/firmware.bin firmware.bin
+          # Complete image for the web installer (install/): bootloader,
+          # partition table and app in one file, flashed at offset 0
+          python tools/make_full_image.py
 
       - name: Sign
         env:
@@ -81,6 +85,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" firmware.bin firmware.bin.sig \
+          gh release create "$GITHUB_REF_NAME" firmware.bin firmware.bin.sig firmware-full.bin \
             --title "Firmware ${{ steps.version.outputs.version }}" \
             --generate-notes

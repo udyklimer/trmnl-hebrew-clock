@@ -22,6 +22,12 @@ Display wiring used by the firmware:
 
 The `KEY1` button (pin `D1`, GPIO 2) is used as the setup button. The `KEY2` button (pin `D2`, GPIO 3) refreshes the clock on demand.
 
+## Installing on a new device
+
+No developer tools are needed: open the clock server's install page, `https://clock.udyklimer.com/install`, in **Chrome** or **Edge** on a computer, connect the device by USB-C and click **Install**. It installs the latest release, including bootloader and partition table, so the device starts on a released version and updates itself over the air from then on. If the device doesn't show up, hold the small **B** button on the XIAO module while plugging it in.
+
+The page is in [install/](install/); [install/README.md](install/README.md) describes what the server has to serve. Each release includes the complete image it installs, `firmware-full.bin`. To flash that file with another tool, write it at offset `0x0`.
+
 ## Build and flash
 
 The project uses [PlatformIO](https://platformio.org/). Libraries are downloaded automatically on the first build.
@@ -185,7 +191,7 @@ Pushing a tag of the form `vX.Y.Z` runs [.github/workflows/release.yml](.github/
 
 1. builds the firmware with PlatformIO, with the version taken from the tag
 2. signs `firmware.bin` with the private key in the `FIRMWARE_SIGNING_KEY` secret (ECDSA P-256, DER signature of the SHA-256), after checking that the key matches the public key in [include/firmware_signing_key.h](include/firmware_signing_key.h)
-3. creates a GitHub release for the tag with two assets, `firmware.bin` and `firmware.bin.sig`
+3. creates a GitHub release for the tag with `firmware.bin` and `firmware.bin.sig` for over-the-air updates, and `firmware-full.bin` for the [web installer](#installing-on-a-new-device)
 
 ### How a device installs an update
 
