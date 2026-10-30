@@ -148,10 +148,11 @@ The `[TIMING]` line on the serial monitor shows the mode of each wake (`mode=bw`
 The image is requested from:
 
 ```
-<server>/clock.png?user=<user name>&fw=<version>&battery_mv=<millivolts>&charging=<0|1>&at=<Unix time>
+<server>/clock.png?user=<user name>&device=<device ID>&fw=<version>&battery_mv=<millivolts>&charging=<0|1>&at=<Unix time>
 ```
 
 - `user`: the user name set in the setup portal.
+- `device`: the ID of this board, its factory MAC address as 12 lower-case hex digits, for example `7c9ebd4a12f0`. It needs no setup and survives reflashing and over-the-air updates. It is sent on every request, including all requests of a battery save batch. When two devices of one user send an ID, the server's settings page lists them, lets the user name each one, and allows separate settings per device. The ID is printed on the serial monitor at every wake and shown on the setup screen.
 - `fw`: the firmware version, for example `1.5.0`, or `0.0.0-dev` for a local build.
 - `at`: the minute to render, as a Unix time in seconds within that minute. Left out when the device does not know the time.
 - `battery_mv`: the battery voltage in millivolts, for example `4063`. It is measured once per wake, before Wi-Fi starts. The device sends the voltage only; the server turns it into a percentage.

@@ -177,7 +177,21 @@ String normalizeServerUrl(String srv) {
   return srv;
 }
 
-// Build final image URL based on server, username, firmware version and battery status.
+// ID of this board for the server, so it can tell a user's devices apart: the
+// factory MAC address as 12 lower-case hex digits. Survives reflashing and OTA.
+const String& deviceId() {
+  static String id;
+  if (id.length() == 0) {
+    uint8_t mac[6];
+    esp_efuse_mac_get_default(mac);
+    char text[13];
+    snprintf(text, sizeof(text), "%02x%02x%02x%02x%02x%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    id = text;
+  }
+  return id;
+}
+
+// Build final image URL based on server, username, device ID, firmware version and battery status.
 // batteryMv <= 0 leaves out both battery parameters; an unknown charging
 // state leaves out only the charging parameter. at != 0 asks for the minute
 // containing that Unix time instead of the current one.
@@ -189,6 +203,9 @@ String buildImageUrl(const String& srv, const String& user, int batteryMv, int c
     url += "user=" + user;
     sep = '&';
   }
+  url += sep;
+  url += "device=" + deviceId();
+  sep = '&';
   url += sep;
   url += "fw=" FW_VERSION;
   sep = '&';
@@ -380,6 +397,7 @@ void showSetupScreen(const String& hotspotName, const String& serverUrl) {
     printCenteredAt("Scan to sign up at", left, 345);
     printCenteredAt(serverHost.c_str(), left, 375);
     printCenteredAt("Have a user name? Skip this.", left, 425);
+    printCenteredAt(("Device " + deviceId()).c_str(), left, 462);
 
     // Step 2: the clock's own hotspot
     display.setFont(&FreeSansBold12pt7b);
@@ -564,6 +582,7 @@ void setup() {
   }
 
   delay(500);
+  Serial.println("Device ID: " + deviceId());
 
   // Local time zone, for the logs and the clock drawn when offline
   setenv("TZ", clockTimezone, 1);
